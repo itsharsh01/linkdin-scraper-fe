@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-DEFAULT_API_BASE = "http://127.0.0.1:8000"
+DEFAULT_API_BASE = "https://linkdin-scraper-be.onrender.com"
 
 
 def _load_dotenv() -> None:
