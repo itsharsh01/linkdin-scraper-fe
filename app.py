@@ -54,6 +54,44 @@ def fetch_bylines(user_id: str, day: date) -> dict[str, Any]:
     return resp.json()
 
 
+def patch_byline_status(user_id: str, byline_id: str, *, status: bool = True) -> dict[str, Any]:
+    resp = requests.patch(
+        f"{api_base()}/users/{user_id}/bylines/{byline_id}/status",
+        json={"status": status},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def patch_bulk_byline_status(user_id: str) -> dict[str, Any]:
+    resp = requests.patch(
+        f"{api_base()}/users/{user_id}/bylines/bulk-status",
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_portfolio_template_email(
+    to_email: str,
+    *,
+    subject: str = "Harsh Gupta – AI/ML Engineer | Open to Opportunities",
+    attach_resume: bool = True,
+) -> dict[str, Any]:
+    resp = requests.post(
+        f"{api_base()}/email/send-template",
+        json={
+            "to_email": to_email.strip(),
+            "subject": subject.strip(),
+            "attach_resume": attach_resume,
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def user_label(user: dict[str, Any]) -> str:
     return f"{user.get('username', '?')} ({user.get('email', '')})"
 
@@ -121,6 +159,67 @@ def format_copy_paste_email(llm: dict[str, Any]) -> tuple[str, str]:
     return meta, email_block
 
 
+def _item_id(item: dict[str, Any]) -> str:
+    return str(item.get("id") or "")
+
+
+def _status_label(status: Any) -> str:
+    return "Done" if status else "Pending"
+
+
+def _invalidate_bylines_cache() -> None:
+    st.session_state.pop("bylines_payload", None)
+    st.session_state.pop("status_snapshot", None)
+    st.session_state.pop("status_snapshot_key", None)
+
+
+def _status_snapshot_key(user_id: str, day_iso: str) -> str:
+    return f"{user_id}:{day_iso}"
+
+
+def _init_status_snapshot(items: list[dict[str, Any]], snapshot_key: str) -> None:
+    if st.session_state.get("status_snapshot_key") == snapshot_key:
+        return
+    st.session_state["status_snapshot"] = {
+        _item_id(item): bool(item.get("status")) for item in items if _item_id(item)
+    }
+    st.session_state["status_snapshot_key"] = snapshot_key
+
+
+def _apply_status_edits(user_id: str, edited_df: pd.DataFrame) -> bool:
+    """Call API when a row's status checkbox goes from unchecked to checked."""
+    snapshot: dict[str, bool] = st.session_state.get("status_snapshot", {})
+    changed = False
+    for _, row in edited_df.iterrows():
+        bid = str(row.get("byline_id") or "")
+        if not bid:
+            continue
+        new_status = bool(row.get("status"))
+        old_status = snapshot.get(bid, False)
+        if new_status and not old_status:
+            patch_byline_status(user_id, bid, status=True)
+            snapshot[bid] = True
+            changed = True
+        elif new_status != old_status:
+            snapshot[bid] = new_status
+    st.session_state["status_snapshot"] = snapshot
+    return changed
+
+
+def _handle_status_api_error(exc: requests.HTTPError) -> None:
+    st.error(f"API error: {exc}")
+    if exc.response is not None:
+        st.code(exc.response.text)
+
+
+def mark_all_pending_done(user_id: str) -> None:
+    result = patch_bulk_byline_status(user_id)
+    _invalidate_bylines_cache()
+    modified = result.get("modified_count", 0)
+    st.success(f"Bulk update: {modified} byline(s) marked as done.")
+    st.rerun()
+
+
 def render_llm_response(llm: dict[str, Any], item_id: str) -> None:
     meta, email_block = format_copy_paste_email(llm)
     st.markdown(meta)
@@ -147,6 +246,48 @@ def main() -> None:
     st.title("Author bylines")
     st.caption(f"API: `{api_base()}`")
 
+    st.subheader("Send portfolio email")
+    st.caption(
+        f"Sends the HTML portfolio template via SMTP. "
+        f"[Preview template]({api_base()}/preview/email-template)"
+    )
+    with st.form("send_portfolio_template_form", clear_on_submit=False):
+        tpl_col1, tpl_col2 = st.columns([2, 1])
+        with tpl_col1:
+            recipient_email = st.text_input(
+                "Recipient email",
+                placeholder="hiring@company.com",
+                help="Email address to receive the portfolio template.",
+            )
+        with tpl_col2:
+            attach_resume = st.checkbox("Attach resume PDF", value=True)
+        email_subject = st.text_input(
+            "Subject",
+            value="Harsh Gupta – AI/ML Engineer | Open to Opportunities",
+        )
+        send_template_clicked = st.form_submit_button("Send template", type="primary")
+
+    if send_template_clicked:
+        recipient = (recipient_email or "").strip()
+        if not recipient:
+            st.error("Enter a recipient email address.")
+        else:
+            try:
+                result = send_portfolio_template_email(
+                    recipient,
+                    subject=email_subject or "Harsh Gupta – AI/ML Engineer | Open to Opportunities",
+                    attach_resume=attach_resume,
+                )
+                st.success(f"Portfolio email sent to **{result.get('to_email', recipient)}**.")
+            except requests.HTTPError as exc:
+                st.error(f"API error: {exc}")
+                if exc.response is not None:
+                    st.code(exc.response.text)
+            except requests.RequestException as exc:
+                st.error(f"Request failed: {exc}. Is the backend running?")
+
+    st.divider()
+
     try:
         users = cached_users()
     except requests.RequestException as exc:
@@ -168,28 +309,57 @@ def main() -> None:
 
     if st.button("Load bylines", type="primary"):
         st.session_state["load_bylines"] = True
+        _invalidate_bylines_cache()
 
     if not st.session_state.get("load_bylines"):
         st.info("Select user and date, then click **Load bylines**.")
         return
 
-    try:
-        payload = fetch_bylines(selected_user_id, selected_date)
-    except requests.HTTPError as exc:
-        st.error(f"API error: {exc}")
-        if exc.response is not None:
-            st.code(exc.response.text)
-        return
-    except requests.RequestException as exc:
-        st.error(f"Request failed: {exc}")
-        return
+    st.session_state["selected_user_id"] = selected_user_id
+    st.session_state["selected_date"] = selected_date.isoformat()
 
+    if "bylines_payload" not in st.session_state:
+        try:
+            st.session_state["bylines_payload"] = fetch_bylines(selected_user_id, selected_date)
+        except requests.HTTPError as exc:
+            _handle_status_api_error(exc)
+            return
+        except requests.RequestException as exc:
+            st.error(f"Request failed: {exc}")
+            return
+
+    payload = st.session_state["bylines_payload"]
     items = payload.get("items") or []
+    pending_items = [i for i in items if not i.get("status")]
+
     st.subheader(f"{payload.get('count', len(items))} bylines on {payload.get('date', selected_date)}")
 
     if not items:
         st.warning("No bylines for this user on the selected date.")
         return
+
+    action_col, bulk_col = st.columns([2, 1])
+    with bulk_col:
+        if st.button(
+            "Bulk mark all pending as done",
+            type="primary",
+            disabled=len(pending_items) == 0,
+            use_container_width=True,
+        ):
+            try:
+                mark_all_pending_done(selected_user_id)
+            except requests.HTTPError as exc:
+                _handle_status_api_error(exc)
+            except requests.RequestException as exc:
+                st.error(f"Request failed: {exc}")
+    with action_col:
+        st.caption(
+            f"{len(pending_items)} pending · {len(items) - len(pending_items)} done. "
+            "Check **Done** in the table to mark a row as true."
+        )
+
+    snapshot_key = _status_snapshot_key(selected_user_id, selected_date.isoformat())
+    _init_status_snapshot(items, snapshot_key)
 
     table_rows: list[dict[str, Any]] = []
     for item in items:
@@ -203,8 +373,9 @@ def main() -> None:
 
         table_rows.append(
             {
+                "byline_id": _item_id(item),
                 "author_name": item.get("author_name") or item.get("authorName") or "",
-                "status": item.get("status"),
+                "status": bool(item.get("status")),
                 "email_skip_reason": item.get("email_skip_reason") or "",
                 "source_url": item.get("source_url") or "",
                 "author_profile_url": item.get("author_profile_url")
@@ -218,41 +389,78 @@ def main() -> None:
 
     df = pd.DataFrame(table_rows)
 
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "source_url": st.column_config.LinkColumn(
-                "Source",
-                display_text="Click here",
-                help="Open source URL in a new tab",
+    try:
+        edited_df = st.data_editor(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key="bylines_table_editor",
+            column_order=(
+                "author_name",
+                "status",
+                "email_skip_reason",
+                "source_url",
+                "author_profile_url",
+                "post_url",
+                "created_at",
+                "text_preview",
             ),
-            "author_profile_url": st.column_config.LinkColumn(
-                "Author profile",
-                display_text="Click here",
-                help="Open author profile in a new tab",
-            ),
-            "post_url": st.column_config.LinkColumn(
-                "Post",
-                display_text="Click here",
-                help="Open LinkedIn post in a new tab",
-            ),
-            "author_name": st.column_config.TextColumn("Author name", width="medium"),
-            "status": st.column_config.CheckboxColumn("Status", disabled=True),
-            "email_skip_reason": st.column_config.TextColumn("email_skip_reason", width="medium"),
-            "text_preview": st.column_config.TextColumn("Post preview", width="large"),
-            "created_at": st.column_config.TextColumn("Created", width="small"),
-        },
-    )
+            column_config={
+                "source_url": st.column_config.LinkColumn(
+                    "Source",
+                    display_text="Click here",
+                    help="Open source URL in a new tab",
+                ),
+                "author_profile_url": st.column_config.LinkColumn(
+                    "Author profile",
+                    display_text="Click here",
+                    help="Open author profile in a new tab",
+                ),
+                "post_url": st.column_config.LinkColumn(
+                    "Post",
+                    display_text="Click here",
+                    help="Open LinkedIn post in a new tab",
+                ),
+                "author_name": st.column_config.TextColumn("Author name", width="medium"),
+                "status": st.column_config.CheckboxColumn(
+                    "Done",
+                    help="Check to set status to true",
+                    default=False,
+                ),
+                "email_skip_reason": st.column_config.TextColumn(
+                    "email_skip_reason", width="medium"
+                ),
+                "text_preview": st.column_config.TextColumn("Post preview", width="large"),
+                "created_at": st.column_config.TextColumn("Created", width="small"),
+            },
+            disabled=[
+                "author_name",
+                "email_skip_reason",
+                "source_url",
+                "author_profile_url",
+                "post_url",
+                "created_at",
+                "text_preview",
+            ],
+        )
+        if _apply_status_edits(selected_user_id, edited_df):
+            _invalidate_bylines_cache()
+            st.toast("Status updated.")
+            st.rerun()
+    except requests.HTTPError as exc:
+        _handle_status_api_error(exc)
+    except requests.RequestException as exc:
+        st.error(f"Request failed: {exc}")
 
     st.divider()
     st.subheader("LLM responses (copy-paste email)")
     for idx, item in enumerate(items):
         name = item.get("author_name") or item.get("authorName") or f"Row {idx + 1}"
         llm = item.get("llm_response")
-        item_id = str(item.get("id") or idx)
-        with st.expander(f"{name} — {item_id[:8]}…"):
+        item_id = _item_id(item) or str(idx)
+        header = f"{name} — {item_id[:8]}… · {_status_label(item.get('status'))}"
+        with st.expander(header):
             if llm is None:
                 st.write("_No LLM response yet._")
             elif not isinstance(llm, dict):
